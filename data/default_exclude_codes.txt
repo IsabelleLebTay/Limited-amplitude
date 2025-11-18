@@ -1,0 +1,22 @@
+# Default species codes to exclude from occurrence dataframe
+# One code per line
+# Lines starting with # are comments and will be ignored
+# Users can provide their own custom exclude list
+
+NONE
+RESQ
+RTHA
+UNWO
+UNKN
+UNPA
+UPCH
+UNBI
+UNSP
+UNTR
+UNTH
+UNMA
+UNWA
+UNFL
+UNVI
+UNCV
+UNTE
