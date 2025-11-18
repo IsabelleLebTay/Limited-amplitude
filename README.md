@@ -172,7 +172,6 @@ pytest -v
 ## Roadmap
 
 - [ ] Command-line interface (currently in development)
-- [ ] Additional output formats (e.g., spatial formats for GIS)
 
 ## License
 
