@@ -395,11 +395,7 @@ def estimate_distance_from_amplitude(
     # Map species to reference species
     result_df['_reference_spp'] = result_df[species_col].map(species_references)
 
-    # # Claude! First, find the nearest predicted value to the amplitude_col, after filtering the predicted_amps DataFrame
-    # # for the correct combination of '_reference_spp', canopy_col, sm2_col
-
-    # # Then, add the column for distance given the nearest predicted value in the result_df, where sitance is taken from the predicted_amp df.
-    # # So the following code is in the wrong order of operation. 1st fine the closest amp, then get the distance.
+    # Merge with predicted amplitudes to find nearest match
     merge_df = result_df[
         result_df['_reference_spp'].notna() & result_df[amplitude_col].notna()
     ].merge(
