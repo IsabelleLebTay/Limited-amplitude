@@ -1,6 +1,6 @@
 # Limited Amplitude
 
-A Python package to apply limited amplitude to acoustic data.
+A Python package to apply limited amplitude to acoustic data from songbirds of the boreal forest of North America. Only for forested landscapes; not suitable for prairie, mountain, or wetlands.
 
 ## Description
 
@@ -14,7 +14,7 @@ This package applies distance-based truncation to acoustic bird detection data u
 
 3. **Amplitude Calculation:** For each detection, amplitude is calculated as the mean of left and right microphone peak RMS dBFS values. If one microphone has issues, only the functional microphone is used.
 
-4. **Distance Estimation:** Using the calibration data from reference species, the package estimates detection distances based on measured amplitudes, accounting for ARU type (SM2 vs SM4) and forest canopy openness (open vs closed).
+4. **Distance Estimation:** Using the calibration data from reference species, the package estimates detection distances based on measured amplitudes, accounting for ARU type (SM2 vs SM3, SM4, or mini) and forest canopy openness (open vs closed).
 
 5. **Truncation:** Detections are filtered based on a user-specified distance threshold (e.g., 150m), removing detections estimated to be beyond that distance.
 
@@ -41,10 +41,12 @@ The package can produce three types of outputs:
 1. **Tags CSV** - WildTrax tags export containing detection data with amplitude measurements
 2. **Recordings CSV** - WildTrax recordings export to fill gaps where no detections occurred
 3. **Metadata CSV** - Location information including:
-   - ARU type (SM2 or SM4)
-   - Canopy openness (open or closed)
-4. **Predicted Amplitudes CSV** - Calibration data showing expected amplitudes for reference species at various distances
-5. **Species References CSV** - Mapping between your species and the reference species used for calibration
+   - `location` - Location identifier
+   - `canopy` - Canopy openness (0 = closed, 1 = open)
+   - `SM2` - ARU type (0 = SM4, 1 = SM2)
+4. **Report CSV** (optional) - WildTrax report export with `task_comments` column for microphone overrides
+5. **Predicted Amplitudes CSV** - Calibration data showing expected amplitudes for reference species at various distances (included in package)
+6. **Species References CSV** - Mapping between your species and the reference species used for calibration (included in package)
 
 ## Installation
 
@@ -63,35 +65,87 @@ pip install -e ".[dev]"
 ### Quick Example
 
 ```python
-from limited_amplitude import occurrence, distance_truncation
+import pandas as pd
+from limited_amplitude import distance_truncation
 
-# 1. Load metadata (location, canopy, SM2/SM4 ARU type)
-metadata_df = distance_truncation.load_metadata(
-    metadata_file="data/metadata.csv"
-)
+# 1. Load your data as DataFrames
+tags_df = pd.read_csv("data/wildtrax_tags.csv")
+recordings_df = pd.read_csv("data/wildtrax_recordings.csv")
+metadata_df = pd.read_csv("data/metadata.csv")
+report_df = pd.read_csv("data/wildtrax_report.csv")  # Optional
 
-# 2. Apply distance truncation to individual tags
+# 2. Validate and prepare metadata
+distance_truncation.validate_metadata(metadata_df)  # Raises error if invalid
+metadata_df = distance_truncation.prepare_metadata(metadata_df)  # Fix types
+
+# 3. Apply distance truncation to individual tags
 truncated_tags = distance_truncation.apply_distance_truncation(
-    tags_csv_path="data/wildtrax_tags.csv",
+    tags_df=tags_df,
     metadata_df=metadata_df,
+    report_df=report_df,  # Optional: enables mic overrides from task_comments
     distance_threshold=150.0  # Distance in meters
 )
 
-# 3. Convert to occurrence format (1/0)
+# 4. Convert to occurrence format (1/0)
 occurrence_df = distance_truncation.convert_to_occurrence(
     truncated_tags=truncated_tags,
-    recordings_csv_path="data/wildtrax_recordings.csv"
+    recordings_df=recordings_df
 )
 
 # OR convert to count format
 count_df = distance_truncation.convert_to_counts(
     truncated_tags=truncated_tags,
-    recordings_csv_path="data/wildtrax_recordings.csv"
+    recordings_df=recordings_df
 )
 
 # Save results
 occurrence_df.to_csv("output/occurrence_150m.csv", index=False)
 count_df.to_csv("output/count_150m.csv", index=False)
+```
+
+### Estimating Distance for Each Detection
+
+```python
+from limited_amplitude import distance_truncation
+
+# Create amplitude dataframe with mean amplitude per detection
+amplitude_df = distance_truncation.create_amplitude_dataframe(
+    tags_df=tags_df,
+    recordings_df=recordings_df,
+    metadata_df=metadata_df,
+    report_df=report_df  # Optional: enables mic overrides
+)
+
+# Estimate distance for each detection based on amplitude
+result_df = distance_truncation.estimate_distance_from_amplitude(amplitude_df)
+# Result includes 'distance_est' column with estimated distance in meters
+```
+
+### Microphone Overrides
+
+If one microphone at a recording location is faulty, you can specify which microphone to use via task comments in the WildTrax report. When you pass `report_df` to `create_amplitude_dataframe` or `apply_distance_truncation`, the package will apply these overrides:
+
+| Task Comment | Effect |
+|--------------|--------|
+| `use left mic only` | Uses left microphone amplitude for both channels |
+| `use right mic only` | Uses right microphone amplitude for both channels |
+
+Comments are case-insensitive. You can also apply overrides manually:
+
+```python
+tags_df = distance_truncation.apply_mic_overrides(tags_df, report_df)
+```
+
+### Metadata Validation and Preparation
+
+The metadata DataFrame must contain `location`, `canopy`, and `SM2` columns:
+
+```python
+# Check if metadata is valid (raises ValueError if not)
+distance_truncation.validate_metadata(metadata_df)
+
+# Prepare metadata (fixes types, fills NaN values)
+metadata_df = distance_truncation.prepare_metadata(metadata_df)
 ```
 
 ### Occurrence Matrix Without Distance Truncation
