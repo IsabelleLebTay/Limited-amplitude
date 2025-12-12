@@ -166,8 +166,8 @@ def calculate_mean_amplitude(
 
 
 def create_amplitude_dataframe(
-    tags_csv_path: Union[str, Path],
-    recordings_csv_path: Union[str, Path],
+    tags_df: pd.DataFrame,
+    recordings_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
     left_amp_col: str = 'left_freq_filter_tag_peak_level_dbfs',
     right_amp_col: str = 'right_freq_filter_tag_peak_level_dbfs',
@@ -195,14 +195,6 @@ def create_amplitude_dataframe(
     Returns:
         DataFrame with location, recording_date_time, and species amplitude columns
     """
-    print(f"Loading tags from {tags_csv_path}...")
-    tags_df = pd.read_csv(tags_csv_path)
-    print(f"Loaded {len(tags_df)} tag records")
-
-    print(f"Loading recordings from {recordings_csv_path}...")
-    recordings_df = pd.read_csv(recordings_csv_path)
-    print(f"Loaded {len(recordings_df)} recording records")
-
     # Apply filters
     if filter_complete_only and 'is_complete' in tags_df.columns:
         tags_df = tags_df[tags_df['is_complete'].isin(
@@ -219,6 +211,10 @@ def create_amplitude_dataframe(
 
     # Calculate mean amplitude for each tag
     if left_amp_col in tags_df.columns and right_amp_col in tags_df.columns:
+
+
+        tags_df = tags_df[['location', 'recording_date_time', 'species_code',
+                     'left_freq_filter_tag_peak_level_dbfs', 'right_freq_filter_tag_peak_level_dbfs']]
         tags_df['mean_amp'] = tags_df.apply(
             lambda row: calculate_mean_amplitude(
                 row[left_amp_col],
@@ -233,42 +229,121 @@ def create_amplitude_dataframe(
 
     # Filter out rows with null amplitude
     tags_df = tags_df[tags_df['mean_amp'].notna()]
-    print(f"Retained {len(tags_df)} records with valid amplitude")
+
+    tags_df['recording_date_time'] = pd.to_datetime(
+        tags_df['recording_date_time'])
+
+    # Fill gaps with recordings that have no detections
+    recordings_df['recording_date_time'] = pd.to_datetime(
+        recordings_df['recording_date_time'])
+
+    recordings_df = recordings_df[['location', 'recording_date_time']]
+
+    # Find recordings not in tags using anti-join
+    not_in_tags_df = recordings_df.merge(
+        tags_df[['location', 'recording_date_time']],
+        on=['location', 'recording_date_time'],
+        how='left',
+        indicator=True
+    ).query('_merge == "left_only"').drop(columns='_merge')
+
+    full_df = pd.concat([tags_df, not_in_tags_df], ignore_index=True)
 
     # Add metadata (canopy and SM2 status)
-    tags_df = pd.merge(
-        tags_df,
+    full_df = pd.merge(
+        full_df,
         metadata_df[['location', 'canopy', 'SM2']],
         on='location',
         how='left'
     )
 
-    # Group by location, recording_date_time, and species to get mean amplitude
-    grouped = tags_df.groupby(
-        ['location', 'recording_date_time', 'species_code']
-    )['mean_amp'].mean().reset_index()
+    return full_df
 
-    # Pivot to wide format with species as columns
-    amplitude_wide = grouped.pivot_table(
-        index=['location', 'recording_date_time'],
-        columns='species_code',
-        values='mean_amp',
-        aggfunc='mean'
-    ).reset_index()
 
-    # Fill gaps with recordings that have no detections
-    all_recordings = recordings_df[['location',
-                                    'recording_date_time']].drop_duplicates()
-    amplitude_df = all_recordings.merge(
-        amplitude_wide,
-        on=['location', 'recording_date_time'],
-        how='left'
-    )
+def estimate_distance_from_amplitude(
+    detections_df: pd.DataFrame,
+    species_col: str = 'species_code',
+    amplitude_col: str = 'mean_amp',
+    canopy_col: int = 1,
+    sm2_col: str = 'SM2'
+) -> pd.DataFrame:
+    """
+    Estimate distance for each detection based on its amplitude value.
 
-    print(
-        f"Created amplitude dataframe with {len(amplitude_df)} recordings and {len(amplitude_df.columns) - 2} species")
+    This function takes a DataFrame of detections (where each row is a unique detection
+    for a given species) and uses the predicted_amps lookup table to estimate the
+    distance based on the mean_amp value for each detection.
 
-    return amplitude_df
+    Args:
+        detections_df: DataFrame with detection records. Must contain columns for
+                      species, amplitude, canopy, and SM2 status.
+        species_col: Column name for species code in detections_df (default: 'species_code').
+        amplitude_col: Column name for mean amplitude in detections_df (default: 'mean_amp').
+        canopy_col: Column name for canopy presence in detections_df (default: 1).
+        sm2_col: Column name for SM2 status in detections_df (default: 'SM2').
+
+    Returns:
+        DataFrame with all original columns plus 'distance_est' column containing
+        the estimated distance for each detection. Returns np.nan for detections
+        where distance cannot be estimated (e.g., species not in reference mapping,
+        amplitude outside predicted range).
+    """
+    print(f"Estimating distances for {len(detections_df)} detections...")
+    predicted_amps = load_predicted_amplitudes()
+    species_references = load_species_references()
+
+    # Create a copy to avoid modifying the original
+    result_df = detections_df.copy()
+
+    # Map species to reference species
+    result_df['_reference_spp'] = result_df[species_col].map(species_references)
+
+    # Process each unique combination of reference species, canopy, and SM2
+    # This is more efficient than row-by-row iteration
+    result_df['distance_est'] = np.nan
+
+    unique_combos = result_df[
+        result_df['_reference_spp'].notna() & result_df[amplitude_col].notna()
+    ][['_reference_spp', canopy_col, sm2_col]].drop_duplicates()
+
+    for _, combo in unique_combos.iterrows():
+        ref_spp = combo['_reference_spp']
+        canopy = combo[canopy_col]
+        sm2 = combo[sm2_col]
+
+        # Get predicted amplitudes for this combination
+        pred_mask = (
+            (predicted_amps['target_spp'] == ref_spp) &
+            (predicted_amps['canopy'] == canopy) &
+            (predicted_amps['SM2'] == sm2)
+        )
+        pred_subset = predicted_amps[pred_mask][['distance', 'predicted']].copy()
+
+        if pred_subset.empty:
+            continue
+
+        # Get detections matching this combination
+        det_mask = (
+            (result_df['_reference_spp'] == ref_spp) &
+            (result_df[canopy_col] == canopy) &
+            (result_df[sm2_col] == sm2) &
+            result_df[amplitude_col].notna()
+        )
+
+        # For each detection in this group, find the nearest predicted amplitude
+        for idx in result_df[det_mask].index:
+            amplitude = result_df.at[idx, amplitude_col]
+            pred_subset['_amp_diff'] = abs(pred_subset['predicted'] - amplitude)
+            nearest_idx = pred_subset['_amp_diff'].idxmin()
+            result_df.at[idx, 'distance_est'] = pred_subset.loc[nearest_idx, 'distance']
+
+    # Clean up temporary column
+    result_df = result_df.drop(columns=['_reference_spp'])
+
+    estimated_count = result_df['distance_est'].notna().sum()
+    print(f"Estimated distances for {estimated_count} of {len(result_df)} detections")
+
+    return result_df
 
 
 def prepare_amplitude_thresholds(
