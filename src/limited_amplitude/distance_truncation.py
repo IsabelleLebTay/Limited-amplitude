@@ -264,7 +264,7 @@ def estimate_distance_from_amplitude(
     detections_df: pd.DataFrame,
     species_col: str = 'species_code',
     amplitude_col: str = 'mean_amp',
-    canopy_col: int = 1,
+    canopy_col: str = 'canopy',
     sm2_col: str = 'SM2'
 ) -> pd.DataFrame:
     """
@@ -276,10 +276,11 @@ def estimate_distance_from_amplitude(
 
     Args:
         detections_df: DataFrame with detection records. Must contain columns for
-                      species, amplitude, canopy, and SM2 status.
+                      species, amplitude, canopy, and SM2 status. Can be the output
+                      of create_amplitude_dataframe.
         species_col: Column name for species code in detections_df (default: 'species_code').
         amplitude_col: Column name for mean amplitude in detections_df (default: 'mean_amp').
-        canopy_col: Column name for canopy presence in detections_df (default: 1).
+        canopy_col: Column name for canopy status in detections_df (default: 'canopy').
         sm2_col: Column name for SM2 status in detections_df (default: 'SM2').
 
     Returns:
@@ -294,51 +295,38 @@ def estimate_distance_from_amplitude(
 
     # Create a copy to avoid modifying the original
     result_df = detections_df.copy()
+    result_df['_idx'] = range(len(result_df))  # Preserve original order
 
     # Map species to reference species
     result_df['_reference_spp'] = result_df[species_col].map(species_references)
 
-    # Process each unique combination of reference species, canopy, and SM2
-    # This is more efficient than row-by-row iteration
-    result_df['distance_est'] = np.nan
+    # # Claude! First, find the nearest predicted value to the amplitude_col, after filtering the predicted_amps DataFrame
+    # # for the correct combination of '_reference_spp', canopy_col, sm2_col
 
-    unique_combos = result_df[
+    # # Then, add the column for distance given the nearest predicted value in the result_df, where sitance is taken from the predicted_amp df.
+    # # So the following code is in the wrong order of operation. 1st fine the closest amp, then get the distance.
+    merge_df = result_df[
         result_df['_reference_spp'].notna() & result_df[amplitude_col].notna()
-    ][['_reference_spp', canopy_col, sm2_col]].drop_duplicates()
+    ].merge(
+        predicted_amps[['target_spp', 'canopy', 'SM2', 'distance', 'predicted']],
+        left_on=['_reference_spp', canopy_col, sm2_col],
+        right_on=['target_spp', 'canopy', 'SM2'],
+        how='left'
+    )
 
-    for _, combo in unique_combos.iterrows():
-        ref_spp = combo['_reference_spp']
-        canopy = combo[canopy_col]
-        sm2 = combo[sm2_col]
+    # Calculate amplitude difference and find nearest match per detection
+    merge_df = merge_df.dropna()
+    merge_df['_amp_diff'] = abs(merge_df['predicted'] - merge_df[amplitude_col])
 
-        # Get predicted amplitudes for this combination
-        pred_mask = (
-            (predicted_amps['target_spp'] == ref_spp) &
-            (predicted_amps['canopy'] == canopy) &
-            (predicted_amps['SM2'] == sm2)
-        )
-        pred_subset = predicted_amps[pred_mask][['distance', 'predicted']].copy()
+    # Get the row with minimum amplitude difference for each original detection
+    nearest = merge_df.loc[merge_df.groupby('_idx')['_amp_diff'].idxmin()]
+    distance_map = nearest.set_index('_idx')['distance']
 
-        if pred_subset.empty:
-            continue
+    # Map back to result
+    result_df['distance_est'] = result_df['_idx'].map(distance_map)
 
-        # Get detections matching this combination
-        det_mask = (
-            (result_df['_reference_spp'] == ref_spp) &
-            (result_df[canopy_col] == canopy) &
-            (result_df[sm2_col] == sm2) &
-            result_df[amplitude_col].notna()
-        )
-
-        # For each detection in this group, find the nearest predicted amplitude
-        for idx in result_df[det_mask].index:
-            amplitude = result_df.at[idx, amplitude_col]
-            pred_subset['_amp_diff'] = abs(pred_subset['predicted'] - amplitude)
-            nearest_idx = pred_subset['_amp_diff'].idxmin()
-            result_df.at[idx, 'distance_est'] = pred_subset.loc[nearest_idx, 'distance']
-
-    # Clean up temporary column
-    result_df = result_df.drop(columns=['_reference_spp'])
+    # Clean up temporary columns
+    result_df = result_df.drop(columns=['_idx', '_reference_spp'])
 
     estimated_count = result_df['distance_est'].notna().sum()
     print(f"Estimated distances for {estimated_count} of {len(result_df)} detections")
@@ -402,7 +390,7 @@ def prepare_amplitude_thresholds(
 
 
 def apply_distance_truncation(
-    tags_csv_path: Union[str, Path],
+    tags_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
     predicted_amps: Optional[Union[pd.DataFrame, str, Path]] = None,
     species_references: Optional[Union[Dict[str, str], str, Path]] = None,
@@ -435,12 +423,6 @@ def apply_distance_truncation(
     Returns:
         DataFrame of individual tags that pass the distance threshold, with mean_amp column
     """
-    print(f"Applying {distance_threshold}m distance truncation to individual tags...")
-    print(f"Loading tags from {tags_csv_path}...")
-
-    tags_df = pd.read_csv(tags_csv_path)
-    print(f"Loaded {len(tags_df)} tag records")
-
     # Apply filters
     if filter_complete_only and 'is_complete' in tags_df.columns:
         tags_df = tags_df[tags_df['is_complete'].isin([True, 't', 'T', 'true', 'True'])]
