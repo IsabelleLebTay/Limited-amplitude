@@ -69,40 +69,23 @@ def load_species_references(file_path: Optional[Union[str, Path]] = None) -> Dic
     return spp_dict
 
 
-def load_metadata(
-    canopy_file: Optional[Union[str, Path]] = None,
-    sm2_file: Optional[Union[str, Path]] = None,
-    metadata_file: Optional[Union[str, Path]] = None
-) -> pd.DataFrame:
+def validate_metadata(metadata_df: pd.DataFrame) -> bool:
     """
-    Load metadata about recording locations (canopy status and ARU type).
+    Validate that a metadata DataFrame has the required columns and types.
+
+    This function checks the metadata without modifying it. Use prepare_metadata()
+    to fix type issues.
 
     Args:
-        canopy_file: Path to CSV with 'location' and 'canopy' columns (0=closed, 1=open)
-        sm2_file: Path to CSV with 'location' and 'SM2' columns (0=SM4, 1=SM2)
-        metadata_file: Path to single CSV with location, canopy, and SM2 columns
-                      (use instead of canopy_file and sm2_file)
+        metadata_df: DataFrame to validate. Must contain 'location', 'canopy',
+                    and 'SM2' columns.
 
     Returns:
-        DataFrame with location, canopy, and SM2 columns
+        True if validation passes.
+
+    Raises:
+        ValueError: If required columns are missing or types are invalid.
     """
-    if metadata_file:
-        print(f"Loading metadata from {metadata_file}...")
-        metadata_df = pd.read_csv(metadata_file)
-    else:
-        if not canopy_file or not sm2_file:
-            raise ValueError(
-                "Must provide either metadata_file or both canopy_file and sm2_file")
-
-        print(f"Loading canopy data from {canopy_file}...")
-        canopy_df = pd.read_csv(canopy_file)
-
-        print(f"Loading SM2 status from {sm2_file}...")
-        sm2_df = pd.read_csv(sm2_file)
-
-        metadata_df = pd.merge(canopy_df, sm2_df, on='location', how='outer')
-
-    # Validate required columns
     required_columns = ['location', 'canopy', 'SM2']
     missing_columns = [
         col for col in required_columns if col not in metadata_df.columns]
@@ -110,13 +93,49 @@ def load_metadata(
         raise ValueError(
             f"Metadata is missing required columns: {missing_columns}")
 
+    # Check if canopy and SM2 can be converted to numeric
+    for col in ['canopy', 'SM2']:
+        try:
+            pd.to_numeric(metadata_df[col], errors='raise')
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Column '{col}' contains non-numeric values that cannot be converted.")
+
+    return True
+
+
+def prepare_metadata(metadata_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepare metadata DataFrame by ensuring correct column types.
+
+    This function creates a copy of the input and fixes type issues:
+    - Converts 'canopy' to numeric (NaN becomes 0)
+    - Converts 'SM2' to numeric (NaN becomes 1)
+
+    Args:
+        metadata_df: DataFrame with 'location', 'canopy', and 'SM2' columns.
+
+    Returns:
+        A copy of the DataFrame with corrected types.
+
+    Raises:
+        ValueError: If required columns are missing.
+    """
+    required_columns = ['location', 'canopy', 'SM2']
+    missing_columns = [
+        col for col in required_columns if col not in metadata_df.columns]
+    if missing_columns:
+        raise ValueError(
+            f"Metadata is missing required columns: {missing_columns}")
+
+    metadata_df = metadata_df.copy()
+
     # Ensure numeric types
     metadata_df['canopy'] = pd.to_numeric(
         metadata_df['canopy'], errors='coerce').fillna(0)
     metadata_df['SM2'] = pd.to_numeric(
         metadata_df['SM2'], errors='coerce').fillna(1)
 
-    print(f"Loaded metadata for {len(metadata_df)} locations")
     return metadata_df
 
 
@@ -165,10 +184,78 @@ def calculate_mean_amplitude(
         raise ValueError(f"Invalid handle_missing value: {handle_missing}")
 
 
+def apply_mic_overrides(
+    tags_df: pd.DataFrame,
+    report_df: pd.DataFrame,
+    left_amp_col: str = 'left_freq_filter_tag_peak_level_dbfs',
+    right_amp_col: str = 'right_freq_filter_tag_peak_level_dbfs',
+    task_comments_col: str = 'task_comments'
+) -> pd.DataFrame:
+    """
+    Apply microphone override based on task comments in the report.
+
+    When a location has a task comment indicating to use only one microphone,
+    this function copies that mic's amplitude to both channels so the mean
+    calculation effectively uses only that microphone.
+
+    Recognized comments (case-insensitive):
+    - "use right mic only": copies right mic value to left mic column
+    - "use left mic only": copies left mic value to right mic column
+
+    Args:
+        tags_df: DataFrame with tag records containing amplitude columns.
+        report_df: DataFrame with 'location' and task_comments_col columns.
+        left_amp_col: Column name for left microphone amplitude.
+        right_amp_col: Column name for right microphone amplitude.
+        task_comments_col: Column name for task comments in report_df.
+
+    Returns:
+        A copy of tags_df with amplitude columns adjusted based on task comments.
+    """
+    tags_df = tags_df.copy()
+
+    if task_comments_col not in report_df.columns:
+        print(f"Warning: '{task_comments_col}' column not found in report. Skipping mic overrides.")
+        return tags_df
+
+    if 'location' not in report_df.columns:
+        print("Warning: 'location' column not found in report. Skipping mic overrides.")
+        return tags_df
+
+    # Normalize task comments to lowercase
+    report_df = report_df.copy()
+    report_df[task_comments_col] = report_df[task_comments_col].fillna('').str.lower().str.strip()
+
+    # Find locations where we should use only one mic
+    use_right_only = report_df.loc[
+        report_df[task_comments_col] == "use right mic only", 'location'
+    ]
+    use_left_only = report_df.loc[
+        report_df[task_comments_col] == "use left mic only", 'location'
+    ]
+
+    # Apply overrides
+    right_only_mask = tags_df['location'].isin(use_right_only)
+    left_only_mask = tags_df['location'].isin(use_left_only)
+
+    # For "use right mic only": copy right to left
+    if right_only_mask.any():
+        tags_df.loc[right_only_mask, left_amp_col] = tags_df.loc[right_only_mask, right_amp_col]
+        print(f"Applied 'use right mic only' override to {right_only_mask.sum()} records")
+
+    # For "use left mic only": copy left to right
+    if left_only_mask.any():
+        tags_df.loc[left_only_mask, right_amp_col] = tags_df.loc[left_only_mask, left_amp_col]
+        print(f"Applied 'use left mic only' override to {left_only_mask.sum()} records")
+
+    return tags_df
+
+
 def create_amplitude_dataframe(
     tags_df: pd.DataFrame,
     recordings_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
+    report_df: Optional[pd.DataFrame] = None,
     left_amp_col: str = 'left_freq_filter_tag_peak_level_dbfs',
     right_amp_col: str = 'right_freq_filter_tag_peak_level_dbfs',
     filter_complete_only: bool = True,
@@ -183,17 +270,20 @@ def create_amplitude_dataframe(
     mean amplitude.
 
     Args:
-        tags_csv_path: Path to WildTrax tags CSV
-        recordings_csv_path: Path to WildTrax recordings CSV
-        metadata_df: DataFrame with location, canopy, and SM2 columns
-        left_amp_col: Column name for left microphone amplitude
-        right_amp_col: Column name for right microphone amplitude
-        filter_complete_only: Only include complete recordings
-        filter_vocalization: Filter to specific vocalization type (e.g., 'Song')
-        filter_task_status: Filter to specific task status (e.g., 'Transcribed')
+        tags_df: DataFrame with WildTrax tags data.
+        recordings_df: DataFrame with WildTrax recordings data.
+        metadata_df: DataFrame with location, canopy, and SM2 columns.
+        report_df: Optional DataFrame with WildTrax report data. If provided and
+                  contains a 'task_comments' column, microphone overrides will be
+                  applied (e.g., "use left mic only", "use right mic only").
+        left_amp_col: Column name for left microphone amplitude.
+        right_amp_col: Column name for right microphone amplitude.
+        filter_complete_only: Only include complete recordings.
+        filter_vocalization: Filter to specific vocalization type (e.g., 'Song').
+        filter_task_status: Filter to specific task status (e.g., 'Transcribed').
 
     Returns:
-        DataFrame with location, recording_date_time, and species amplitude columns
+        DataFrame with location, recording_date_time, and species amplitude columns.
     """
     # Apply filters
     if filter_complete_only and 'is_complete' in tags_df.columns:
@@ -209,12 +299,17 @@ def create_amplitude_dataframe(
         tags_df = tags_df[tags_df['aru_task_status'] == filter_task_status]
         print(f"Filtered to {len(tags_df)} {filter_task_status} records")
 
+    # Apply microphone overrides based on task comments if report is provided
+    if report_df is not None:
+        tags_df = apply_mic_overrides(
+            tags_df, report_df, left_amp_col, right_amp_col
+        )
+
     # Calculate mean amplitude for each tag
     if left_amp_col in tags_df.columns and right_amp_col in tags_df.columns:
 
-
-        tags_df = tags_df[['location', 'recording_date_time', 'species_code',
-                     'left_freq_filter_tag_peak_level_dbfs', 'right_freq_filter_tag_peak_level_dbfs']]
+        tags_df = tags_df[['location', 'recording_date_time', 'species_code', 'detection_time', 'task_duration',
+                           'left_freq_filter_tag_peak_level_dbfs', 'right_freq_filter_tag_peak_level_dbfs']]
         tags_df['mean_amp'] = tags_df.apply(
             lambda row: calculate_mean_amplitude(
                 row[left_amp_col],
@@ -352,6 +447,9 @@ def prepare_amplitude_thresholds(
     """
     print(f"Preparing amplitude thresholds for {distance_threshold}m...")
 
+    # Work on a copy to avoid modifying the input DataFrame
+    predicted_amps = predicted_amps.copy()
+
     # Find nearest distance to threshold for each combination
     predicted_amps['distance_to_threshold'] = abs(
         predicted_amps['distance'] - distance_threshold
@@ -392,6 +490,7 @@ def prepare_amplitude_thresholds(
 def apply_distance_truncation(
     tags_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
+    report_df: Optional[pd.DataFrame] = None,
     predicted_amps: Optional[Union[pd.DataFrame, str, Path]] = None,
     species_references: Optional[Union[Dict[str, str], str, Path]] = None,
     distance_threshold: float = 150.0,
@@ -408,20 +507,23 @@ def apply_distance_truncation(
     its mean amplitude value.
 
     Args:
-        tags_csv_path: Path to WildTrax tags CSV
-        metadata_df: DataFrame with location, canopy, and SM2 columns
+        tags_df: DataFrame with WildTrax tags data.
+        metadata_df: DataFrame with location, canopy, and SM2 columns.
+        report_df: Optional DataFrame with WildTrax report data. If provided and
+                  contains a 'task_comments' column, microphone overrides will be
+                  applied (e.g., "use left mic only", "use right mic only").
         predicted_amps: DataFrame with predicted amplitudes, or path to CSV file.
                        If None, uses default data/all_spp_predicted_amplitudes.csv
         species_references: Dictionary mapping species to reference species, or path to CSV file.
                            If None, uses default data/species and references.csv
-        distance_threshold: Distance in meters for truncation (default: 150.0)
-        filter_complete_only: Only include complete recordings
-        filter_vocalization: Filter to specific vocalization type (e.g., 'Song')
-        left_amp_col: Column name for left microphone amplitude
-        right_amp_col: Column name for right microphone amplitude
+        distance_threshold: Distance in meters for truncation (default: 150.0).
+        filter_complete_only: Only include complete recordings.
+        filter_vocalization: Filter to specific vocalization type (e.g., 'Song').
+        left_amp_col: Column name for left microphone amplitude.
+        right_amp_col: Column name for right microphone amplitude.
 
     Returns:
-        DataFrame of individual tags that pass the distance threshold, with mean_amp column
+        DataFrame of individual tags that pass the distance threshold, with mean_amp column.
     """
     # Apply filters
     if filter_complete_only and 'is_complete' in tags_df.columns:
@@ -431,6 +533,12 @@ def apply_distance_truncation(
     if filter_vocalization and 'vocalization' in tags_df.columns:
         tags_df = tags_df[tags_df['vocalization'] == filter_vocalization]
         print(f"Filtered to {len(tags_df)} {filter_vocalization} records")
+
+    # Apply microphone overrides based on task comments if report is provided
+    if report_df is not None:
+        tags_df = apply_mic_overrides(
+            tags_df, report_df, left_amp_col, right_amp_col
+        )
 
     # Load predicted amplitudes if needed
     if predicted_amps is None or isinstance(predicted_amps, (str, Path)):
@@ -505,7 +613,7 @@ def apply_distance_truncation(
 
 def convert_to_occurrence(
     truncated_tags: pd.DataFrame,
-    recordings_csv_path: Union[str, Path]
+    recordings_df: pd.DataFrame
 ) -> pd.DataFrame:
     """
     Convert truncated tags to occurrence/occupancy format (1/0).
@@ -513,19 +621,17 @@ def convert_to_occurrence(
     This function:
     1. Takes individual tags that passed distance truncation
     2. Converts to binary presence/absence per species per recording
-    3. Ensures ALL location + recording_date_time combinations from recordings CSV are included
+    3. Ensures ALL location + recording_date_time combinations from recordings DataFrame are included
 
     Args:
         truncated_tags: DataFrame of individual tags from apply_distance_truncation()
-        recordings_csv_path: Path to WildTrax recordings CSV (ground truth of all recordings)
+        recordings_df: DataFrame with all recordings (ground truth of all recordings).
+                      Must contain 'location' and 'recording_date_time' columns.
 
     Returns:
         DataFrame with location, recording_date_time, and binary species occurrence (1/0)
     """
     print(f"Converting truncated tags to occurrence format...")
-    print(f"Loading all recordings from {recordings_csv_path}...")
-
-    recordings_df = pd.read_csv(recordings_csv_path)
 
     # Get all unique location + recording_date_time combinations (ground truth)
     all_recordings = recordings_df[['location', 'recording_date_time']].drop_duplicates()
@@ -568,7 +674,7 @@ def convert_to_occurrence(
 
 def convert_to_counts(
     truncated_tags: pd.DataFrame,
-    recordings_csv_path: Union[str, Path]
+    recordings_df: pd.DataFrame
 ) -> pd.DataFrame:
     """
     Convert truncated tags to count format.
@@ -576,19 +682,17 @@ def convert_to_counts(
     This function:
     1. Takes individual tags that passed distance truncation
     2. Counts the number of detections per species per recording
-    3. Ensures ALL location + recording_date_time combinations from recordings CSV are included
+    3. Ensures ALL location + recording_date_time combinations from recordings DataFrame are included
 
     Args:
         truncated_tags: DataFrame of individual tags from apply_distance_truncation()
-        recordings_csv_path: Path to WildTrax recordings CSV (ground truth of all recordings)
+        recordings_df: DataFrame with all recordings (ground truth of all recordings).
+                      Must contain 'location' and 'recording_date_time' columns.
 
     Returns:
         DataFrame with location, recording_date_time, and species detection counts
     """
     print(f"Converting truncated tags to count format...")
-    print(f"Loading all recordings from {recordings_csv_path}...")
-
-    recordings_df = pd.read_csv(recordings_csv_path)
 
     # Get all unique location + recording_date_time combinations (ground truth)
     all_recordings = recordings_df[['location', 'recording_date_time']].drop_duplicates()
