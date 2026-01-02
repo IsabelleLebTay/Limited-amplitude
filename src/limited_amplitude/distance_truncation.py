@@ -729,6 +729,103 @@ def convert_to_counts(
     return count_complete
 
 
+def estimate_distance_hawkears(
+    hawkears_df: pd.DataFrame,
+    metadata_df: pd.DataFrame,
+    species_col: str = 'species',
+    amplitude_col: str = 'rms_dbfs_avg',
+    location_col: str = 'location',
+    canopy_col: str = 'canopy',
+    sm2_col: str = 'SM2',
+    status_col: str = 'status'
+) -> pd.DataFrame:
+    """
+    Estimate distance for HawkEars format detections based on amplitude values.
+
+    This function is designed for the custom HawkEars CSV format, which differs from
+    WildTrax in that:
+    - Mean amplitude is already calculated (rms_dbfs_avg column)
+    - No song/call distinction (no vocalization filter needed)
+    - No transcribed status filter (all entries are transcribed)
+    - Bad weather/malfunction entries have no amplitude value (status='skip')
+
+    Args:
+        hawkears_df: DataFrame with HawkEars detection data. Must contain columns for
+                    species, amplitude (rms_dbfs_avg), and location.
+        metadata_df: DataFrame with location metadata. Must contain 'location', 'canopy',
+                    and 'SM2' columns for mapping environmental/equipment context.
+        species_col: Column name for species code (default: 'species').
+        amplitude_col: Column name for mean amplitude in dBFS (default: 'rms_dbfs_avg').
+        location_col: Column name for location identifier (default: 'location').
+        canopy_col: Column name for canopy status in metadata (default: 'canopy').
+        sm2_col: Column name for SM2 status in metadata (default: 'SM2').
+        status_col: Column name for status in hawkears_df (default: 'status').
+                   Rows with status != 'complete' will have NaN distance estimates.
+
+    Returns:
+        DataFrame with all original columns plus 'distance_est' column containing
+        the estimated distance in meters for each detection. Returns np.nan for
+        detections where distance cannot be estimated (e.g., species not in reference
+        mapping, missing amplitude, status != 'complete').
+    """
+    # Load reference data
+    predicted_amps = load_predicted_amplitudes()
+    species_references = load_species_references()
+
+    # Create a copy to avoid modifying the original
+    result_df = hawkears_df.copy()
+
+    # Merge with metadata to get canopy and SM2 status
+    metadata_subset = metadata_df[[location_col, canopy_col, sm2_col]].drop_duplicates(subset=[location_col])
+    result_df = pd.merge(
+        result_df,
+        metadata_subset,
+        on=location_col,
+        how='left'
+    )
+
+    result_df['_idx'] = range(len(result_df))  # Preserve original order
+
+    # Map species to reference species
+    result_df['_reference_spp'] = result_df[species_col].map(species_references)
+
+    # Only process rows with complete status and valid amplitude
+    valid_mask = (
+        result_df['_reference_spp'].notna() &
+        result_df[amplitude_col].notna()
+    )
+    if status_col in result_df.columns:
+        valid_mask = valid_mask & (result_df[status_col] == 'complete')
+
+    # Merge with predicted amplitudes to find nearest match
+    merge_df = result_df[valid_mask].merge(
+        predicted_amps[['target_spp', 'canopy', 'SM2', 'distance', 'predicted']],
+        left_on=['_reference_spp', canopy_col, sm2_col],
+        right_on=['target_spp', 'canopy', 'SM2'],
+        how='left',
+        suffixes=('', '_pred')
+    )
+
+    # Calculate amplitude difference and find nearest match per detection
+    merge_df = merge_df.dropna(subset=['predicted'])
+    merge_df['_amp_diff'] = abs(merge_df['predicted'] - merge_df[amplitude_col])
+
+    # Get the row with minimum amplitude difference for each original detection
+    if not merge_df.empty:
+        nearest = merge_df.loc[merge_df.groupby('_idx')['_amp_diff'].idxmin()]
+        distance_map = nearest.set_index('_idx')['distance']
+    else:
+        distance_map = pd.Series(dtype=float)
+
+    # Map back to result
+    result_df['distance_est'] = result_df['_idx'].map(distance_map)
+
+    # Clean up temporary columns
+    result_df = result_df.drop(columns=['_idx', '_reference_spp'])
+
+    return result_df
+
+
 def get_truncation_summary(
     amplitude_df: pd.DataFrame,
     truncated_df: pd.DataFrame
