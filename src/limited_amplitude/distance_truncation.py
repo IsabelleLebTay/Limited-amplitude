@@ -187,8 +187,8 @@ def calculate_mean_amplitude(
 def apply_mic_overrides(
     tags_df: pd.DataFrame,
     report_df: pd.DataFrame,
-    left_amp_col: str = 'left_freq_filter_tag_peak_level_dbfs',
-    right_amp_col: str = 'right_freq_filter_tag_peak_level_dbfs',
+    left_amp_col: str = 'left_full_freq_tag_rms_peak_dbfs',
+    right_amp_col: str = 'right_full_freq_tag_rms_peak_dbfs',
     task_comments_col: str = 'task_comments'
 ) -> pd.DataFrame:
     """
@@ -256,8 +256,8 @@ def create_amplitude_dataframe(
     recordings_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
     report_df: Optional[pd.DataFrame] = None,
-    left_amp_col: str = 'left_freq_filter_tag_peak_level_dbfs',
-    right_amp_col: str = 'right_freq_filter_tag_peak_level_dbfs',
+    left_amp_col: str = 'left_full_freq_tag_rms_peak_dbfs',
+    right_amp_col: str = 'right_full_freq_tag_rms_peak_dbfs',
     filter_complete_only: bool = True,
     filter_vocalization: Optional[str] = 'Song',
     filter_task_status: Optional[str] = 'Transcribed'
@@ -309,7 +309,7 @@ def create_amplitude_dataframe(
     if left_amp_col in tags_df.columns and right_amp_col in tags_df.columns:
 
         tags_df = tags_df[['location', 'recording_date_time', 'species_code', 'detection_time', 'task_duration',
-                           'left_freq_filter_tag_peak_level_dbfs', 'right_freq_filter_tag_peak_level_dbfs']]
+                           'left_full_freq_tag_rms_peak_dbfs', 'right_full_freq_tag_rms_peak_dbfs']]
         tags_df['mean_amp'] = tags_df.apply(
             lambda row: calculate_mean_amplitude(
                 row[left_amp_col],
@@ -492,8 +492,8 @@ def apply_distance_truncation(
     distance_threshold: float = 150.0,
     filter_complete_only: bool = True,
     filter_vocalization: Optional[str] = 'Song',
-    left_amp_col: str = 'left_freq_filter_tag_peak_level_dbfs',
-    right_amp_col: str = 'right_freq_filter_tag_peak_level_dbfs'
+    left_amp_col: str = 'left_full_freq_tag_rms_peak_dbfs',
+    right_amp_col: str = 'right_full_freq_tag_rms_peak_dbfs'
 ) -> pd.DataFrame:
     """
     Apply distance truncation to individual tag records.
